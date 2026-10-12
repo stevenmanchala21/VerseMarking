@@ -702,7 +702,7 @@ canvas#waveform, canvas#wave-overlay { width: 100%; height: 100%; position: abso
     VerseMarking 
   </a>
   <div class="nav-right">
-    <button class="theme-toggle launcher-logic" id="open-lp-btn" title="Open Logic Pro Editor">🚀 Pro Launcher 2</button>
+    <button class="theme-toggle launcher-logic" id="open-lp-btn" title="Open Logic Pro Editor">🚀 Adobe Audition Lite </button>
     <button class="theme-toggle" id="support-btn">❓ Support</button>
     <button class="theme-toggle" id="theme-toggle">🌙 Dark Mode</button>
   </div>
@@ -1195,7 +1195,7 @@ const bibleData = {
   "Zechariah": [21, 13, 10, 14, 11, 15, 14, 23, 17, 12, 17, 14, 9, 21],
   "Malachi": [14, 17, 18, 6],
   "Matthew": [25, 23, 17, 25, 48, 34, 29, 34, 38, 42, 30, 50, 58, 36, 39, 28, 27, 35, 30, 34, 46, 46, 39, 51, 46, 75, 66, 20],
-  "Mark": [45, 28, 35, 41, 43, 53, 37, 38, 50, 52, 33, 44, 37, 72, 47, 20],
+  "Mark": [45, 28, 35, 41, 43, 56, 37, 38, 50, 52, 33, 44, 37, 72, 47, 20],
   "Luke": [80, 52, 38, 44, 39, 49, 50, 56, 62, 42, 54, 59, 35, 35, 32, 31, 37, 43, 48, 47, 38, 71, 56, 53],
   "John": [51, 25, 36, 54, 47, 71, 53, 59, 41, 42, 57, 50, 38, 31, 27, 33, 26, 40, 42, 31, 25],
   "Acts": [26, 47, 26, 37, 42, 15, 60, 40, 43, 48, 30, 25, 52, 28, 41, 40, 34, 28, 41, 38, 40, 30, 35, 27, 27, 32, 44, 31],
@@ -1575,10 +1575,24 @@ function modifyWavLossless(buffer, startSec, endSec, insertSecs = 0, insertBuffe
 }
 
 
+function findAudioEnd(buf, th) {
+  // Time (sec) of the end of the last audible sample (any channel above threshold).
+  // Everything after this point is treated as Logic Pro's export padding.
+  if (!buf) return 0;
+  const chans = [];
+  for (let c = 0; c < buf.numberOfChannels; c++) chans.push(buf.getChannelData(c));
+  for (let i = buf.length - 1; i >= 0; i--) {
+    for (let c = 0; c < chans.length; c++) {
+      if (Math.abs(chans[c][i]) > th) return (i + 1) / buf.sampleRate;
+    }
+  }
+  return buf.length / buf.sampleRate; // fully silent file: leave untouched
+}
+
 function updateTailNote() {
   const s = parseFloat(tailSecsInput.value) || 2;
   tailNote.style.display = appendChk.checked ? 'block' : 'none';
-  tailNote.innerHTML = `Adds ${s}s silence to end.`;
+  tailNote.innerHTML = `Trims Logic's extra tail, then adds exactly ${s}s silence.`;
 }
 appendChk.addEventListener('change', updateTailNote);
 tailSecsInput.addEventListener('input', updateTailNote);
@@ -3059,20 +3073,6 @@ processBtn.addEventListener('click', async () => {
 
   const originalMarkerCount = detectedMarkers.length;
   const warn = (originalMarkerCount - 1 !== nv) ? ` <span style="color: #eab308; font-weight: 600;">(Found ${originalMarkerCount - 1}, expected ${nv})</span>` : '';
-  
-  // ── LOSSLESS TAIL SILENCE INJECTION ──
-  const tSecs = appendChk.checked ? (parseFloat(tailSecsInput.value) || 2) : 0;
-  if (tSecs > 0) {
-    saveStateForUndo(); 
-    rawWavBytes = modifyWavLossless(rawWavBytes, Infinity, Infinity, tSecs);
-    
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    audioBuffer = await ctx.decodeAudioData(rawWavBytes.slice(0));
-
-    appendChk.checked = false; updateTailNote();
-    await syncAudioPlayer(); 
-    log(`<span class="ok">Losslessly injected ${tSecs}s tail silence.</span>`);
-  }
 
   setProgress(100); setTimeout(()=>{progWrap.style.display='none'; setProgress(0);}, 400);
   log(`<span style="color: var(--ok); font-weight: 600;">Detection Successful</span> <span style="color: var(--text-main); font-weight: 600;">— ${detectedMarkers.length} markers securely plotted</span>${warn}`);
@@ -3111,8 +3111,25 @@ dlWav.addEventListener('click', async () => {
   dlWav.disabled=true;
   setTimeout(async () => {
     try {
-      const v = new DataView(rawWavBytes); let off=12, rate=48000;
-      while(off < rawWavBytes.byteLength-8) {
+      // Tail silence is added here, at export time, and ONLY here — Process no longer
+      // touches it. Computed fresh from rawWavBytes on every click (never mutated in
+      // place), so downloading twice in a row can't compound into 4s, 6s, etc., and the
+      // in-app waveform always shows the untouched original audio.
+      // 1) Trim whatever silence Logic Pro left after the last audible sample (the extra ms / 0.5s).
+      // 2) Then append exactly the Tail Silence value. Result: last sound + tail = exact gap.
+      // Both steps run on a fresh copy of rawWavBytes each click, so repeated downloads never compound.
+      const tSecs = appendChk.checked ? (parseFloat(tailSecsInput.value) || 2) : 0;
+      let baseBytes = rawWavBytes;
+      if (tSecs > 0) {
+        const th = parseFloat($('threshold').value) || 0.005;
+        const endSec = findAudioEnd(audioBuffer, th) + 0.5 / audioBuffer.sampleRate; // half-sample guard vs. rounding
+        const origSecs = audioBuffer.length / audioBuffer.sampleRate;
+        baseBytes = modifyWavLossless(rawWavBytes, endSec, Infinity, tSecs);
+        log(`<span class="ok">Trimmed ${Math.max(0, origSecs - endSec).toFixed(3)}s of export padding, then appended ${tSecs}s tail silence.</span>`);
+      }
+
+      const v = new DataView(baseBytes); let off=12, rate=48000;
+      while(off < baseBytes.byteLength-8) {
         const id = v.getUint32(off, false), sz = v.getUint32(off+4, true);
         if(id === 0x666d7420) { rate = v.getUint32(off+12,true); break; }
         off += 8 + sz + (sz%2);
@@ -3137,11 +3154,11 @@ dlWav.addEventListener('click', async () => {
       const au=new Uint8Array(ab); let p=12;
       ls.forEach(l=>{ [0x6c,0x61,0x62,0x6c].forEach((x,i)=>au[p+i]=x); av.setUint32(p+4,l.length,true); au.set(l,p+8); p+=8+l.length; });
       
-      const rSz = rawWavBytes.byteLength + cb.byteLength + ab.byteLength;
+      const rSz = baseBytes.byteLength + cb.byteLength + ab.byteLength;
       const out = new Uint8Array(rSz);
-      out.set(new Uint8Array(rawWavBytes), 0);
-      out.set(new Uint8Array(cb), rawWavBytes.byteLength);
-      out.set(new Uint8Array(ab), rawWavBytes.byteLength + cb.byteLength);
+      out.set(new Uint8Array(baseBytes), 0);
+      out.set(new Uint8Array(cb), baseBytes.byteLength);
+      out.set(new Uint8Array(ab), baseBytes.byteLength + cb.byteLength);
       
       const ov = new DataView(out.buffer);
       ov.setUint32(4, v.getUint32(4,true) + cb.byteLength + ab.byteLength, true);
